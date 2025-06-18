@@ -1,0 +1,710 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'json'
+require 'optparse'
+require 'set'
+
+class Promptr
+  def initialize
+    @prompts_dir = File.join(File.dirname(__FILE__), '..', 'prompts')
+  end
+
+  def run(args)
+    return show_help if args.empty?
+
+    # Check for global flags
+    @verbose = args.include?('-v') || args.include?('--verbose')
+    args = args.reject { |arg| arg == '-v' || arg == '--verbose' }
+
+    return show_help if args.empty?
+
+    command = args[0]
+    case command
+    when 'list'
+      list_commands
+    when 'help', '--help', '-h'
+      if args[1]
+        show_prompt_help(args[1])
+      else
+        show_help
+      end
+    else
+      # Check if second arg is 'help'
+      if args[1] == 'help'
+        show_prompt_help(command)
+      else
+        execute_prompt(command, args[1..-1])
+      end
+    end
+  end
+
+  def show_help
+    puts "Usage: promptr [flags] <command|file-path> [options]"
+    puts ""
+    puts "Global flags:"
+    puts "  -v, --verbose           Show live output instead of spinner"
+    puts ""
+    puts "Commands:"
+    puts "  list                    List available prompt files in prompts directory"
+    puts "  help                    Show this help message"
+    puts "  help <command>          Show detailed help for a specific prompt"
+    puts "  <command> help          Show detailed help for a specific prompt"
+    puts "  <command>               Execute a prompt by name (searches ./prompts directory)"
+    puts "  <file-path>             Execute a prompt file by path"
+    puts ""
+    puts "File resolution:"
+    puts "  - If argument has extension: treats as direct file path"
+    puts "  - If no extension: searches ./prompts for <command>.prompt.yaml, <command>.md, <command>.txt"
+    puts ""
+    puts "Supported file types:"
+    puts "  *.prompt.yaml           Structured YAML prompts with message format"
+    puts "  *.md                    Markdown files with variable substitution"
+    puts "  *.txt                   Text files with variable substitution"
+    puts ""
+    puts "Requirements validation (YAML only):"
+    puts "  requirements:"
+    puts "    commands: [cmd1, cmd2]      # Required executables"
+    puts "    tools: [Edit, Write, Read]  # Claude Code tools to allow"
+    puts "    environment: [VAR1, VAR2]   # Required env variables"
+    puts "    directories: [./dir1]       # Required directories"
+    puts ""
+    puts "Available prompts in prompts directory:"
+    list_commands
+    puts ""
+    puts "Options:"
+    puts "  --json JSON_STRING      Pass variables as JSON"
+    puts "  --file FILE_PATH        Load variables from JSON/YAML file"
+    puts "  key=value               Set individual variables"
+    puts "  key=@file               Set variable from file contents"
+    puts ""
+    puts "Variable substitution:"
+    puts "  Use {{variable_name}} in .md/.txt files for variable replacement"
+    puts ""
+    puts "Security:"
+    puts "  Commands listed in 'requirements.commands' are automatically granted"
+    puts "  access via Claude's --allowedTools parameter"
+  end
+
+  def list_commands
+    return unless Dir.exist?(@prompts_dir)
+
+    # List all supported file types
+    patterns = ["*.prompt.yaml", "*.md", "*.txt"]
+    files = []
+
+    patterns.each do |pattern|
+      Dir.glob("#{@prompts_dir}/#{pattern}").each do |file|
+        files << file
+      end
+    end
+
+    commands = []
+    files.each do |file|
+      basename = File.basename(file)
+
+      # Remove extensions to show command names
+      command_name = case basename
+      when /\.prompt\.yaml$/
+        basename.sub(/\.prompt\.yaml$/, '')
+      when /\.md$/
+        basename.sub(/\.md$/, '')
+      when /\.txt$/
+        basename.sub(/\.txt$/, '')
+      else
+        basename
+      end
+
+      commands << command_name
+    end
+
+    commands.sort.uniq.each do |command|
+      puts "  #{command}"
+    end
+  end
+
+  def execute_prompt(command, args)
+    # Try to find the prompt file - either as direct path or in prompts directory
+    prompt_file = find_prompt_file(command)
+    unless prompt_file
+      puts "Error: Prompt '#{command}' not found"
+      puts "Tried:"
+      puts "  - Direct path: #{File.expand_path(command)}"
+      puts "  - In prompts directory with extensions: .prompt.yaml, .md, .txt"
+      puts ""
+      puts "Available prompts in prompts directory:"
+      list_commands
+      exit 1
+    end
+
+    # Validate file extension
+    ext = File.extname(prompt_file)
+    unless ['.yaml', '.md', '.txt'].include?(ext)
+      puts "Error: Unsupported file type: #{ext}"
+      puts "Supported types: .prompt.yaml, .md, .txt"
+      exit 1
+    end
+
+    variables = parse_variables(args)
+    prompt_data = load_and_render_prompt(prompt_file, variables)
+
+    # Extract rendered prompt and requirements
+    rendered_prompt = prompt_data[:prompt]
+    requirements = prompt_data[:requirements]
+
+    # Validate requirements
+    validate_requirements(requirements) if requirements
+
+    # Build Claude command with allowed tools
+    claude_cmd = build_claude_command(rendered_prompt, requirements)
+
+    # Show spinner only if not verbose and outputting to a terminal
+    show_spinner = !@verbose && $stdout.tty?
+    spinner_thread = nil
+
+    if @verbose
+      $stderr.puts "🤖 Running: #{claude_cmd.join(' ')}"
+      $stderr.puts ""
+      # In verbose mode, stream and parse JSON output
+      result = stream_claude_output(claude_cmd)
+    else
+      # Non-verbose mode with spinner
+      begin
+        if show_spinner
+          $stderr.puts "🤖 Thinking..."
+
+          # Create a spinner in a separate thread
+          spinner_thread = Thread.new do
+            spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            i = 0
+            while true
+              $stderr.print "\r#{spinner_chars[i % spinner_chars.length]} Processing prompt..."
+              sleep(0.1)
+              i += 1
+            end
+          end
+        end
+
+        result = system(*claude_cmd)
+
+      ensure
+        # Always clean up spinner, even if there's an error
+        if spinner_thread
+          spinner_thread.kill
+          $stderr.print "\r" + " " * 30 + "\r"
+        end
+      end
+    end
+
+    result
+  end
+
+  private
+
+  def show_prompt_help(command)
+    # Try to find the prompt file
+    prompt_file = find_prompt_file(command)
+    unless prompt_file
+      puts "Error: Prompt '#{command}' not found"
+      puts "Available prompts:"
+      list_commands
+      return
+    end
+
+    file_extension = File.extname(prompt_file)
+
+    case file_extension
+    when '.yaml'
+      show_yaml_prompt_help(prompt_file)
+    when '.md', '.txt'
+      show_text_prompt_help(prompt_file)
+    else
+      puts "Error: Unsupported file type: #{file_extension}"
+    end
+  end
+
+  def show_yaml_prompt_help(prompt_file)
+    begin
+      config = YAML.load_file(prompt_file)
+
+      puts "📋 Prompt: #{config['name'] || File.basename(prompt_file, '.prompt.yaml')}"
+      puts "📝 Description: #{config['description']}" if config['description']
+      puts "🤖 Model: #{config['model']}" if config['model']
+      puts ""
+
+      # Show requirements
+      if config['requirements']
+        puts "⚙️  Requirements:"
+        if config['requirements']['commands']
+          puts "   Commands: #{config['requirements']['commands'].join(', ')}"
+        end
+        if config['requirements']['tools']
+          puts "   Tools: #{config['requirements']['tools'].join(', ')}"
+        end
+        if config['requirements']['environment']
+          puts "   Environment: #{config['requirements']['environment'].join(', ')}"
+        end
+        if config['requirements']['directories']
+          puts "   Directories: #{config['requirements']['directories'].join(', ')}"
+        end
+        puts ""
+      end
+
+      # Extract and show variables
+      variables = extract_variables_from_messages(config['messages'] || [])
+      if variables.any?
+        puts "🔧 Variables:"
+        variables.each do |var|
+          puts "   #{var}=<value>"
+        end
+        puts ""
+        puts "💡 Usage examples:"
+        puts "   promptr #{File.basename(prompt_file, '.prompt.yaml')} #{variables.map{|v| "#{v}=value"}.join(' ')}"
+        puts "   promptr #{File.basename(prompt_file, '.prompt.yaml')} --json '{#{variables.map{|v| "\"#{v}\":\"value\""}.join(',')}}'"
+      else
+        puts "🔧 Variables: none"
+        puts ""
+        puts "💡 Usage:"
+        puts "   promptr #{File.basename(prompt_file, '.prompt.yaml')}"
+      end
+
+    rescue => e
+      puts "Error reading prompt file: #{e.message}"
+    end
+  end
+
+  def show_text_prompt_help(prompt_file)
+    begin
+      content = File.read(prompt_file)
+
+      puts "📋 Prompt: #{File.basename(prompt_file)}"
+      puts "📝 Type: #{File.extname(prompt_file)} file"
+      puts ""
+
+      # Extract and show variables
+      variables = extract_variables_from_text(content)
+      if variables.any?
+        puts "🔧 Variables:"
+        variables.each do |var|
+          puts "   #{var}=<value>"
+        end
+        puts ""
+        puts "💡 Usage examples:"
+        basename = File.basename(prompt_file, File.extname(prompt_file))
+        puts "   promptr #{basename} #{variables.map{|v| "#{v}=value"}.join(' ')}"
+        puts "   promptr #{basename} --json '{#{variables.map{|v| "\"#{v}\":\"value\""}.join(',')}}'"
+      else
+        puts "🔧 Variables: none"
+        puts ""
+        puts "💡 Usage:"
+        puts "   promptr #{File.basename(prompt_file, File.extname(prompt_file))}"
+      end
+
+      # Show preview of content (first few lines)
+      puts ""
+      puts "📄 Preview:"
+      content.lines.first(5).each do |line|
+        puts "   #{line.chomp}"
+      end
+      puts "   ..." if content.lines.length > 5
+
+    rescue => e
+      puts "Error reading prompt file: #{e.message}"
+    end
+  end
+
+  def stream_claude_output(claude_cmd)
+    require 'open3'
+
+    success = false
+    Open3.popen3(*claude_cmd) do |stdin, stdout, stderr, wait_thr|
+      stdin.close
+
+      # Read and parse streaming JSON output
+      stdout.each_line do |line|
+        line = line.strip
+        next if line.empty?
+
+        # Debug: show raw lines
+        $stderr.puts "[RAW] #{line}" if ENV['DEBUG']
+
+        begin
+          json_data = JSON.parse(line)
+          $stderr.puts "[JSON] #{json_data.inspect}" if ENV['DEBUG']
+          handle_stream_json(json_data)
+        rescue JSON::ParserError => e
+          # If it's not valid JSON, just print it as-is
+          $stderr.puts "[PARSE ERROR] #{e.message}: #{line}" if ENV['DEBUG']
+          puts line
+          $stdout.flush
+        end
+      end
+
+      # Print any errors
+      stderr.each_line do |line|
+        $stderr.puts "[STDERR] #{line}"
+      end
+
+      success = wait_thr.value.success?
+    end
+
+    success
+  end
+
+  def handle_stream_json(data)
+    case data['type']
+    when 'system'
+      # System initialization - show basic info
+      puts "🔧 Session started (#{data['session_id'][0..7]}...)" if data['session_id']
+    when 'assistant'
+      # Assistant message
+      message = data['message']
+      return unless message
+
+      message['content']&.each do |content|
+        case content['type']
+        when 'text'
+          puts "🤖 #{content['text']}"
+        when 'tool_use'
+          tool_name = content['name']
+          puts "\n🔧 Using #{tool_name}:"
+          if content['input'] && content['input']['command']
+            puts "   Running: #{content['input']['command']}"
+          end
+        end
+      end
+    when 'user'
+      # User message (tool results)
+      message = data['message']
+      return unless message
+
+      message['content']&.each do |content|
+        if content['type'] == 'tool_result'
+          puts "\n📤 Tool output:"
+          output = content['content']
+          if content['is_error']
+            puts "❌ Error: #{output}"
+          else
+            puts output
+          end
+        end
+      end
+    else
+      # For debugging: print unknown types
+      if ENV['DEBUG']
+        puts "\n[DEBUG] #{data['type']}: #{data.inspect}"
+      end
+    end
+  end
+
+  def find_prompt_file(command)
+    # First, try as a direct file path
+    direct_path = File.expand_path(command)
+    return direct_path if File.exist?(direct_path)
+
+    # If it has an extension but wasn't found as direct path, don't try prompts directory
+    return nil if command.include?('.')
+
+    # Try in prompts directory with different extensions
+    extensions = ['.prompt.yaml', '.md', '.txt']
+    extensions.each do |ext|
+      candidate = File.join(@prompts_dir, "#{command}#{ext}")
+      return candidate if File.exist?(candidate)
+    end
+
+    nil
+  end
+
+  def load_and_render_prompt(prompt_file, variables)
+    file_extension = File.extname(prompt_file)
+
+    case file_extension
+    when '.yaml'
+      # Handle .prompt.yaml files
+      prompt_config = YAML.load_file(prompt_file)
+      rendered_prompt = render_prompt(prompt_config, variables)
+      requirements = prompt_config['requirements']
+      { prompt: rendered_prompt, requirements: requirements }
+    when '.md', '.txt'
+      # Handle markdown and text files
+      content = File.read(prompt_file)
+      rendered_prompt = render_simple_prompt(content, variables)
+      { prompt: rendered_prompt, requirements: nil }
+    else
+      puts "Error: Unsupported file type: #{file_extension}"
+      exit 1
+    end
+  end
+
+  def render_simple_prompt(content, variables)
+    # Substitute variables in simple text/markdown files
+    rendered_content = substitute_variables(content, variables)
+
+    # Extract variables from content to check for missing ones
+    required_vars = extract_variables_from_text(content)
+    missing_vars = required_vars - variables.keys
+    unless missing_vars.empty?
+      puts "Error: Missing required variables: #{missing_vars.join(', ')}"
+      puts "Required variables:"
+      required_vars.each { |var| puts "  #{var}=<value>" }
+      exit 1
+    end
+
+    rendered_content
+  end
+
+  def extract_variables_from_text(text)
+    variables = Set.new
+    text.scan(/\{\{(\w+)\}\}/).each do |match|
+      variables.add(match[0])
+    end
+    variables.to_a
+  end
+
+  def validate_requirements(requirements)
+    return unless requirements.is_a?(Hash)
+
+    # Validate required commands exist
+    if requirements['commands']
+      missing_commands = []
+      requirements['commands'].each do |cmd|
+        missing_commands << cmd unless command_exists?(cmd)
+      end
+
+      unless missing_commands.empty?
+        puts "Error: Missing required commands: #{missing_commands.join(', ')}"
+        puts "Please install the required tools before running this prompt."
+        exit 1
+      end
+    end
+
+    # Validate required environment variables
+    if requirements['environment']
+      missing_env = []
+      requirements['environment'].each do |env_var|
+        unless ENV[env_var]
+          missing_env << env_var
+        end
+      end
+
+      unless missing_env.empty?
+        puts "Error: Missing required environment variables: #{missing_env.join(', ')}"
+        exit 1
+      end
+    end
+
+    # Validate required directories exist
+    if requirements['directories']
+      missing_dirs = []
+      requirements['directories'].each do |dir|
+        expanded_dir = File.expand_path(dir)
+        unless Dir.exist?(expanded_dir)
+          missing_dirs << dir
+        end
+      end
+
+      unless missing_dirs.empty?
+        puts "Error: Missing required directories: #{missing_dirs.join(', ')}"
+        exit 1
+      end
+    end
+  end
+
+  def command_exists?(command)
+    # Handle absolute paths
+    return File.executable?(command) if command.start_with?('/')
+
+    # Handle relative paths (contains '/' but doesn't start with '/')
+    if command.include?('/')
+      expanded_path = File.expand_path(command)
+      return File.executable?(expanded_path)
+    end
+
+    # Check in PATH for simple command names
+    ENV['PATH'].split(File::PATH_SEPARATOR).any? do |path|
+      executable = File.join(path, command)
+      File.executable?(executable)
+    end
+  end
+
+  def build_claude_command(rendered_prompt, requirements)
+    cmd = ['claude', '-p', rendered_prompt]
+
+    # Add streaming output format if verbose
+    if @verbose
+      cmd += ['--output-format', 'stream-json', '--verbose']
+    end
+
+    # Add allowed tools if requirements specify them
+    if requirements && (requirements['commands'] || requirements['tools'])
+      allowed_tools = []
+
+      # Add bash commands if specified
+      if requirements['commands']
+        bash_tools = requirements['commands'].map { |command| "Bash(#{command}:*)" }
+        allowed_tools.concat(bash_tools)
+      end
+
+      # Add Claude Code tools if specified, otherwise use safe defaults
+      if requirements['tools']
+        allowed_tools.concat(requirements['tools'])
+      else
+        # Default safe tools that don't modify files
+        default_tools = ["Read", "Glob", "Grep", "LS"]
+        allowed_tools.concat(default_tools)
+      end
+
+      cmd += ['--allowedTools', allowed_tools.join(',')]
+    end
+
+    cmd
+  end
+
+  def parse_variables(args)
+    variables = {}
+    options = {}
+
+    i = 0
+    while i < args.length
+      arg = args[i]
+
+      if arg == '--json' && i + 1 < args.length
+        begin
+          json_vars = JSON.parse(args[i + 1])
+          variables.merge!(json_vars)
+        rescue JSON::ParserError => e
+          puts "Error: Invalid JSON: #{e.message}"
+          exit 1
+        end
+        i += 2
+      elsif arg == '--file' && i + 1 < args.length
+        file_path = args[i + 1]
+        unless File.exist?(file_path)
+          puts "Error: File not found: #{file_path}"
+          exit 1
+        end
+
+        begin
+          if file_path.end_with?('.json')
+            file_vars = JSON.load_file(file_path)
+          elsif file_path.end_with?('.yml', '.yaml')
+            file_vars = YAML.load_file(file_path)
+          else
+            puts "Error: Unsupported file format. Use .json, .yml, or .yaml"
+            exit 1
+          end
+
+          variables.merge!(file_vars)
+        rescue => e
+          puts "Error: Failed to parse file #{file_path}: #{e.message}"
+          exit 1
+        end
+        i += 2
+      elsif arg.match?(/^(\w+)=(.*)$/)
+        key, value = arg.split('=', 2)
+
+        # If value starts with @, treat as file path
+        if value.start_with?('@')
+          file_path = File.expand_path(value[1..-1])  # Remove @ prefix and expand path
+          unless File.exist?(file_path)
+            puts "Error: File not found: #{file_path}"
+            exit 1
+          end
+
+          begin
+            value = File.read(file_path)
+          rescue => e
+            puts "Error: Failed to read file #{file_path}: #{e.message}"
+            exit 1
+          end
+        end
+
+        variables[key] = value
+        i += 1
+      else
+        puts "Warning: Ignoring invalid argument format: #{arg}"
+        puts "Expected format: key=value (use key=@file for file contents)"
+        i += 1
+      end
+    end
+
+    variables
+  end
+
+  def render_prompt(config, variables)
+    required_vars = extract_variables_from_messages(config['messages'] || [])
+
+    missing_vars = required_vars - variables.keys
+    unless missing_vars.empty?
+      puts "Error: Missing required variables: #{missing_vars.join(', ')}"
+      puts "Required variables for this command:"
+      required_vars.each { |var| puts "  #{var}=<value>" }
+      exit 1
+    end
+
+    rendered_config = substitute_variables(config, variables)
+    format_for_claude(rendered_config)
+  end
+
+  def extract_variables_from_messages(messages)
+    variables = Set.new
+    messages.each do |message|
+      content = message['content'] || ''
+      content.scan(/\{\{(\w+)\}\}/).each do |match|
+        variables.add(match[0])
+      end
+    end
+
+    variables.to_a
+  end
+
+  def substitute_variables(obj, variables)
+    case obj
+    when Hash
+      obj.transform_values { |v| substitute_variables(v, variables) }
+    when Array
+      obj.map { |v| substitute_variables(v, variables) }
+    when String
+      obj.gsub(/\{\{(\w+)\}\}/) do |match|
+        var_name = $1
+        variables[var_name] || match
+      end
+    else
+      obj
+    end
+  end
+
+  def format_for_claude(config)
+    # Create a simple text format that claude -p can understand
+    prompt_parts = []
+
+    prompt_parts << "# #{config['name']}" if config['name']
+    prompt_parts << config['description'] if config['description']
+
+    prompt_parts << ""
+    (config['messages'] || []).map do |message|
+      role = message['role']
+      content = message['content']
+
+      case role
+      when 'system'
+        prompt_parts << "System: #{content}"
+      when 'user'
+        prompt_parts << "User: #{content}"
+      when 'assistant'
+        prompt_parts << "Assistant: #{content}"
+      end
+      prompt_parts << ""
+    end
+
+    prompt_parts << "Please provide only your responses, with no other commentary."
+
+    prompt_parts.join("\n")
+  end
+end
+
+# Run CLI
+if __FILE__ == $0
+  promptr = Promptr.new
+  promptr.run(ARGV)
+end
