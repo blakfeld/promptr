@@ -95,7 +95,7 @@ promptr my-prompt --file variables.yaml
 
 ### YAML Frontmatter Support
 
-**New feature!** Markdown and text files now support YAML frontmatter for requirements specification. This allows you to add the same powerful validation and tool permissions to simple `.md` and `.txt` files:
+Markdown and text files now support YAML frontmatter for requirements specification. This allows you to add the same powerful validation and tool permissions to simple `.md` and `.txt` files:
 
 ```markdown
 ---
