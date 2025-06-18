@@ -16,7 +16,7 @@ Promptr takes prompt files (`.md`, `.prompt.yaml`, or `.txt`), processes variabl
 ## Features
 
 - **📜 Executable prompts**: Add `#!/usr/bin/env promptr` shebang to any prompt file and execute it directly like a script
-- **Multiple file formats**: Support for `.prompt.yaml` (following [GitHub's specification](https://docs.github.com/en/github-models/use-github-models/storing-prompts-in-github-repositories)), `.md`, and `.txt` files
+- **Multiple file formats**: Support for `.prompt.yaml` (following [GitHub's specification](https://docs.github.com/en/github-models/use-github-models/storing-prompts-in-github-repositories)), `.md`, and `.txt` files with YAML frontmatter support
 - **Variable substitution**: Dynamic content using `{{variable_name}}` syntax
 - **Requirements validation**: Automatic checking for required commands, tools, environment variables, and directories
 - **Security controls**: Fine-grained tool permissions via requirements specification
@@ -93,6 +93,28 @@ promptr my-prompt --file variables.json
 promptr my-prompt --file variables.yaml
 ```
 
+### YAML Frontmatter Support
+
+**New feature!** Markdown and text files now support YAML frontmatter for requirements specification. This allows you to add the same powerful validation and tool permissions to simple `.md` and `.txt` files:
+
+```markdown
+---
+name: "Advanced Code Reviewer" 
+description: "Comprehensive code analysis with security focus"
+requirements:
+  commands: ["git", "eslint", "cargo"]
+  tools: ["Read", "Edit", "Grep", "Bash"]
+  environment: ["GITHUB_TOKEN"]
+  directories: ["./src", "./tests"]
+---
+
+# Advanced Code Review
+
+Please perform a comprehensive review of {{file_path}}...
+```
+
+This brings the full power of requirements validation to simple markdown prompts!
+
 ## File Formats
 
 ### YAML Prompts (`.prompt.yaml`)
@@ -117,8 +139,9 @@ messages:
 
 ### Markdown/Text Files (`.md`, `.txt`)
 
-Simple files with variable substitution:
+Simple files with variable substitution. **NEW**: Now supports YAML frontmatter for requirements!
 
+#### Basic Markdown/Text
 ```markdown
 # Code Review Request
 
@@ -128,8 +151,25 @@ Please review the following code for {{language}}:
 
 Focus on:
 - Performance
-- Security
+- Security  
 - Best practices
+```
+
+#### Markdown with YAML Frontmatter
+```markdown
+---
+name: "Bug Fixer"
+description: "Find and fix bugs in code"
+requirements:
+  commands: ["cargo", "git"]
+  tools: ["Read", "Edit", "Bash"]
+  directories: ["."]
+---
+
+# Bug Analysis
+
+Find and fix bugs in {{language}} code at {{file_path}}.
+Focus on {{bug_type}} issues and provide fixes.
 ```
 
 ## Requirements Validation
@@ -143,7 +183,34 @@ Promptr validates requirements before execution:
 
 ### Security Model
 
-Commands listed in `requirements.commands` are automatically granted access via Claude's `--allowedTools` parameter as `Bash(command:*)`. If no tools are specified, safe defaults are used: `["Read", "Glob", "Grep", "LS"]`.
+Commands listed in `requirements.commands` are automatically granted access via Claude's `--allowedTools` parameter as `Bash(command:*)`. Tools listed in `requirements.tools` are granted specific permissions. If no tools are specified, safe defaults are used: `["Read", "Glob", "Grep", "LS"]`.
+
+#### Available Claude Code Tools
+
+**Read-only tools:**
+- `Read`: Read files from filesystem
+- `Glob`: Fast file pattern matching
+- `Grep`: Content search with regex
+- `LS`: List directory contents
+
+**File editing tools:**
+- `Edit`: Make exact string replacements in files
+- `MultiEdit`: Make multiple edits to a single file
+
+**File creation tools:**
+- `Write`: Create new files or overwrite existing ones
+
+**External tools:**
+- `WebFetch`: Fetch and process web content
+- `WebSearch`: Search the web for information
+
+**Task management tools:**
+- `TodoRead`: Read current todo list
+- `TodoWrite`: Create and manage task lists
+
+**Development tools:**
+- `Task`: Launch new agent with tools access
+- `exit_plan_mode`: Exit planning mode
 
 ## Examples
 

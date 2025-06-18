@@ -40,50 +40,97 @@ class Promptr
   end
 
   def show_help
-    puts "Usage: promptr [flags] <command|file-path> [options]"
-    puts ""
-    puts "Global flags:"
-    puts "  -v, --verbose           Show live output instead of spinner"
-    puts ""
-    puts "Commands:"
-    puts "  list                    List available prompt files in prompts directory"
-    puts "  help                    Show this help message"
-    puts "  help <command>          Show detailed help for a specific prompt"
-    puts "  <command> help          Show detailed help for a specific prompt"
-    puts "  <command>               Execute a prompt by name (searches ./prompts directory)"
-    puts "  <file-path>             Execute a prompt file by path"
-    puts ""
-    puts "File resolution:"
-    puts "  - If argument has extension: treats as direct file path"
-    puts "  - If no extension: searches ./prompts for <command>.prompt.yaml, <command>.md, <command>.txt"
-    puts ""
-    puts "Supported file types:"
-    puts "  *.prompt.yaml           Structured YAML prompts with message format"
-    puts "  *.md                    Markdown files with variable substitution"
-    puts "  *.txt                   Text files with variable substitution"
-    puts ""
-    puts "Requirements validation (YAML only):"
-    puts "  requirements:"
-    puts "    commands: [cmd1, cmd2]      # Required executables"
-    puts "    tools: [Edit, Write, Read]  # Claude Code tools to allow"
-    puts "    environment: [VAR1, VAR2]   # Required env variables"
-    puts "    directories: [./dir1]       # Required directories"
-    puts ""
-    puts "Available prompts in prompts directory:"
+    puts <<~HELP
+      Usage: promptr [flags] <command|file-path> [options]
+
+      Global flags:
+        -v, --verbose           Show live output instead of spinner
+
+      Commands:
+        list                    List available prompt files in prompts directory
+        help                    Show this help message
+        help <command>          Show detailed help for a specific prompt
+        <command> help          Show detailed help for a specific prompt
+        <command>               Execute a prompt by name (searches ./prompts directory)
+        <file-path>             Execute a prompt file by path
+
+      File resolution:
+        - If argument has extension: treats as direct file path
+        - If no extension: searches ./prompts for <command>.prompt.yaml, <command>.md, <command>.txt
+
+      Supported file types:
+        *.prompt.yaml           Structured YAML prompts with message format
+        *.md                    Markdown files with variable substitution (supports YAML frontmatter)
+        *.txt                   Text files with variable substitution (supports YAML frontmatter)
+
+      Requirements validation (YAML files & frontmatter):
+        requirements:
+          commands: [cmd1, cmd2]      # Required executables
+          tools: [Edit, Write, Read]  # Claude Code tools to allow
+          environment: [VAR1, VAR2]   # Required env variables (inherited from shell)
+          directories: [./dir1]       # Required directories (auto-added with --add-dir)
+
+      Available prompts in prompts directory:
+    HELP
+    
     list_commands
-    puts ""
-    puts "Options:"
-    puts "  --json JSON_STRING      Pass variables as JSON"
-    puts "  --file FILE_PATH        Load variables from JSON/YAML file"
-    puts "  key=value               Set individual variables"
-    puts "  key=@file               Set variable from file contents"
-    puts ""
-    puts "Variable substitution:"
-    puts "  Use {{variable_name}} in .md/.txt files for variable replacement"
-    puts ""
-    puts "Security:"
-    puts "  Commands listed in 'requirements.commands' are automatically granted"
-    puts "  access via Claude's --allowedTools parameter"
+    
+    puts <<~HELP
+
+      Options:
+        --json JSON_STRING      Pass variables as JSON
+        --file FILE_PATH        Load variables from JSON/YAML file
+        key=value               Set individual variables
+        key=@file               Set variable from file contents
+
+      Variable substitution:
+        Use {{variable_name}} in .md/.txt files for variable replacement
+
+      Security & Tools:
+        Commands listed in 'requirements.commands' are automatically granted
+        access via Claude's --allowedTools parameter
+        Directories listed in 'requirements.directories' are automatically
+        added via Claude's --add-dir parameter for safe access
+        Environment variables in 'requirements.environment' are validated
+        and inherited from your current shell environment
+
+      Available Claude Code tools:
+        Read-only: Read, Glob, Grep, LS
+        File editing: Edit, MultiEdit
+        File creation: Write
+        External: WebFetch, WebSearch
+        Task management: TodoRead, TodoWrite
+        Development: Task, exit_plan_mode
+
+      Example YAML prompt:
+        name: Code Reviewer
+        description: Review code and suggest improvements
+        model: claude-sonnet-4-20250514
+        requirements:
+          commands: [git, cargo]
+          tools: [Read, Edit, Grep]
+          environment: [GITHUB_TOKEN]
+          directories: [.]
+        messages:
+          - role: user
+            content: 'Review {{file_path}} for {{review_type}} issues'
+
+      Example Markdown prompt with frontmatter:
+        ---
+        name: Bug Fixer
+        description: Find and fix bugs in code
+        requirements:
+          commands: [cargo, git]
+          tools: [Read, Edit, Bash]
+          environment: [RUST_BACKTRACE]
+          directories: [./src, ./tests]
+        ---
+        
+        # Bug Analysis
+        
+        Find and fix bugs in {{language}} code at {{file_path}}.
+        Focus on {{bug_type}} issues and provide fixes.
+    HELP
   end
 
   def list_commands
@@ -185,7 +232,7 @@ class Promptr
           end
         end
 
-        result = system(*claude_cmd)
+        result = system(ENV, *claude_cmd)
 
       ensure
         # Always clean up spinner, even if there's an error
@@ -276,13 +323,36 @@ class Promptr
   def show_text_prompt_help(prompt_file)
     begin
       content = File.read(prompt_file)
+      frontmatter, body = parse_frontmatter(content)
 
-      puts "📋 Prompt: #{File.basename(prompt_file)}"
-      puts "📝 Type: #{File.extname(prompt_file)} file"
+      # Use frontmatter data if available, otherwise fallback to filename
+      name = frontmatter['name'] || File.basename(prompt_file, File.extname(prompt_file))
+      puts "📋 Prompt: #{name}"
+      puts "📝 Description: #{frontmatter['description']}" if frontmatter['description']
+      puts "🤖 Model: #{frontmatter['model']}" if frontmatter['model']
+      puts "📝 Type: #{File.extname(prompt_file)} file#{frontmatter.any? ? ' with YAML frontmatter' : ''}"
       puts ""
 
+      # Show requirements from frontmatter
+      if frontmatter['requirements']
+        puts "⚙️  Requirements:"
+        if frontmatter['requirements']['commands']
+          puts "   Commands: #{frontmatter['requirements']['commands'].join(', ')}"
+        end
+        if frontmatter['requirements']['tools']
+          puts "   Tools: #{frontmatter['requirements']['tools'].join(', ')}"
+        end
+        if frontmatter['requirements']['environment']
+          puts "   Environment: #{frontmatter['requirements']['environment'].join(', ')}"
+        end
+        if frontmatter['requirements']['directories']
+          puts "   Directories: #{frontmatter['requirements']['directories'].join(', ')}"
+        end
+        puts ""
+      end
+
       # Extract and show variables
-      variables = extract_variables_from_text(content)
+      variables = extract_variables_from_text(body)
       if variables.any?
         puts "🔧 Variables:"
         variables.each do |var|
@@ -300,13 +370,13 @@ class Promptr
         puts "   promptr #{File.basename(prompt_file, File.extname(prompt_file))}"
       end
 
-      # Show preview of content (first few lines)
+      # Show preview of content (first few lines of body, not frontmatter)
       puts ""
       puts "📄 Preview:"
-      content.lines.first(5).each do |line|
+      body.lines.first(5).each do |line|
         puts "   #{line.chomp}"
       end
-      puts "   ..." if content.lines.length > 5
+      puts "   ..." if body.lines.length > 5
 
     rescue => e
       puts "Error reading prompt file: #{e.message}"
@@ -317,7 +387,7 @@ class Promptr
     require 'open3'
 
     success = false
-    Open3.popen3(*claude_cmd) do |stdin, stdout, stderr, wait_thr|
+    Open3.popen3(ENV, *claude_cmd) do |stdin, stdout, stderr, wait_thr|
       stdin.close
 
       # Read and parse streaming JSON output
@@ -426,10 +496,12 @@ class Promptr
       requirements = prompt_config['requirements']
       { prompt: rendered_prompt, requirements: requirements }
     when '.md', '.txt'
-      # Handle markdown and text files
+      # Handle markdown and text files with optional YAML frontmatter
       content = File.read(prompt_file)
-      rendered_prompt = render_simple_prompt(content, variables)
-      { prompt: rendered_prompt, requirements: nil }
+      frontmatter, body = parse_frontmatter(content)
+      rendered_prompt = render_simple_prompt(body, variables)
+      requirements = frontmatter['requirements']
+      { prompt: rendered_prompt, requirements: requirements }
     else
       puts "Error: Unsupported file type: #{file_extension}"
       exit 1
@@ -459,6 +531,31 @@ class Promptr
       variables.add(match[0])
     end
     variables.to_a
+  end
+
+  def parse_frontmatter(content)
+    # Check if content starts with YAML frontmatter
+    if content.start_with?("---\n")
+      parts = content.split(/^---\s*$/, 3)
+
+      if parts.length >= 3
+        # We have frontmatter
+        frontmatter_yaml = parts[1]
+        body = parts[2].lstrip # Remove leading whitespace after second ---
+
+        begin
+          frontmatter = YAML.load(frontmatter_yaml) || {}
+        rescue => e
+          $stderr.puts "Warning: Invalid YAML frontmatter: #{e.message}"
+          frontmatter = {}
+        end
+
+        return [frontmatter, body]
+      end
+    end
+
+    # No frontmatter found, return empty hash and full content
+    [{}, content]
   end
 
   def validate_requirements(requirements)
@@ -555,6 +652,14 @@ class Promptr
       end
 
       cmd += ['--allowedTools', allowed_tools.join(',')]
+    end
+
+    # Add directories if specified
+    if requirements && requirements['directories']
+      requirements['directories'].each do |dir|
+        expanded_dir = File.expand_path(dir)
+        cmd += ['--add-dir', expanded_dir]
+      end
     end
 
     cmd
